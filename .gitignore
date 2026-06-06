@@ -1,0 +1,15 @@
+# Secrets — never commit
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Playwright / bot debug screenshots (generated at runtime)
+probe*.png
+error_state.png
+activities_page.png
+invoice_preview.png
+invoice_draft_saved.png
