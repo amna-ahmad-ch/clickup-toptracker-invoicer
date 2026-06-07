@@ -61,11 +61,7 @@ python main.py --start 2026-06-01 --end 2026-06-06 --invoice-only -y
 python main.py
 ```
 
-### Headless (no browser window)
 
-```bash
-python main.py --current-week -y --headless
-```
 
 ---
 
@@ -164,4 +160,10 @@ python main.py --dry-run --current-week
 
 # Re-create draft from activities already in TopTracker
 python main.py --current-week --invoice-only -y
+
+### Headless (no browser window)
+
+```bash
+python main.py --current-week -y --headless
+```
 ```
