@@ -77,6 +77,83 @@ def format_date_range(start: datetime, end: datetime) -> str:
     )
 
 
+def parse_toptracker_date(date_str: str) -> datetime:
+    """Parse TopTracker date string, e.g. 'Jun 1, 2026'."""
+    return datetime.strptime(date_str, "%b %d, %Y")
+
+
+def _date_matches(actual: str, expected: datetime) -> bool:
+    actual = actual.strip()
+    if not actual:
+        return False
+    for fmt in ("%b %d, %Y", "%b %d, %Y"):
+        try:
+            if datetime.strptime(actual, fmt).date() == expected.date():
+                return True
+        except ValueError:
+            pass
+    for candidate in (
+        f"{expected.strftime('%b')} {expected.day}, {expected.year}",
+        f"{expected.strftime('%b')} {expected.day:02d}, {expected.year}",
+    ):
+        if actual == candidate:
+            return True
+    return False
+
+
+async def _read_start_date(form) -> str:
+    return await form.locator('input[type="text"]').nth(1).input_value()
+
+
+async def set_start_date(form, page: Page, date_str: str):
+    """
+    Set the Start Date on the manual time entry form.
+    TopTracker defaults to today — React inputs need explicit change events.
+    """
+    expected = parse_toptracker_date(date_str)
+    date_input = form.locator('input[type="text"]').nth(1)
+
+    await date_input.click(click_count=3)
+    await date_input.evaluate(
+        """(el, value) => {
+            el.value = value;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('blur', { bubbles: true }));
+        }""",
+        date_str,
+    )
+    await page.wait_for_timeout(400)
+
+    if _date_matches(await _read_start_date(form), expected):
+        return
+
+    await date_input.click(click_count=3)
+    await date_input.fill(date_str)
+    await date_input.press("Enter")
+    await page.wait_for_timeout(400)
+
+    if _date_matches(await _read_start_date(form), expected):
+        return
+
+    # Fallback: pick the day from the calendar widget
+    await date_input.click()
+    await page.wait_for_timeout(500)
+
+    aria_day = expected.strftime("%B %d, %Y").replace(" 0", " ")  # "June 2, 2026"
+    day_pick = page.locator(f'[aria-label*="{aria_day}"], [aria-label*="{expected.strftime("%B")} {expected.day},"]')
+    if await day_pick.count():
+        await day_pick.first.click()
+    else:
+        calendar = page.locator('[class*="calendar"], [class*="DayPicker"], [role="dialog"]')
+        await calendar.get_by_role("button", name=str(expected.day), exact=True).first.click()
+
+    await page.wait_for_timeout(400)
+    if not _date_matches(await _read_start_date(form), expected):
+        actual = await _read_start_date(form)
+        raise RuntimeError(f"Could not set start date to {date_str} (field shows {actual!r})")
+
+
 async def open_create_invoice_form(page: Page):
     await navigate_to_invoices(page)
     await page.get_by_role("button", name="Create Invoice").click()
@@ -161,14 +238,8 @@ async def add_manual_entry(page: Page, entry: dict, project_name: str):
     except Exception:
         pass  # project is often pre-selected to the only project
 
+    await set_start_date(form, page, entry["date"])
     await form.locator("#description").fill(description_text)
-
-    # Start Date label points to #date but the input has no id — use position in form
-    date_input = form.locator('input[type="text"]').nth(1)
-    await date_input.click(click_count=3)
-    await date_input.fill(entry["date"])
-    await form.get_by_text("Add Manual Time Entry").click()  # close datepicker overlay
-    await page.wait_for_timeout(200)
 
     total_minutes = int(round(entry["hours"] * 60))
     duration_str = f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
