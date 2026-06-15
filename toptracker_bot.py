@@ -101,56 +101,87 @@ def _date_matches(actual: str, expected: datetime) -> bool:
     return False
 
 
-async def _read_start_date(form) -> str:
-    return await form.locator('input[type="text"]').nth(1).input_value()
+def _manual_entry_form(page: Page):
+    return page.locator("form").filter(has=page.locator("#description")).first
 
 
-async def set_start_date(form, page: Page, date_str: str):
+def _date_input(page: Page):
+    return _manual_entry_form(page).locator('input[type="text"]').nth(1)
+
+
+async def _read_start_date(page: Page) -> str:
+    if not await _modal_is_open(page):
+        return ""
+    form = _manual_entry_form(page)
+    await form.get_by_text("Add Manual Time Entry").click()
+    await page.wait_for_timeout(200)
+    return await _date_input(page).input_value(timeout=5_000)
+
+
+async def _modal_is_open(page: Page) -> bool:
+    return await page.locator("#description").is_visible()
+
+
+async def set_start_date(page: Page, date_str: str):
     """
     Set the Start Date on the manual time entry form.
-    TopTracker defaults to today — React inputs need explicit change events.
+    Uses calendar picker first — Enter after typing can submit the whole form.
     """
+    if not await _modal_is_open(page):
+        raise RuntimeError("Manual time entry modal closed unexpectedly")
+
     expected = parse_toptracker_date(date_str)
-    date_input = form.locator('input[type="text"]').nth(1)
+    date_input = _date_input(page)
 
-    await date_input.click(click_count=3)
-    await date_input.evaluate(
-        """(el, value) => {
-            el.value = value;
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            el.dispatchEvent(new Event('blur', { bubbles: true }));
-        }""",
-        date_str,
-    )
-    await page.wait_for_timeout(400)
-
-    if _date_matches(await _read_start_date(form), expected):
-        return
-
-    await date_input.click(click_count=3)
-    await date_input.fill(date_str)
-    await date_input.press("Enter")
-    await page.wait_for_timeout(400)
-
-    if _date_matches(await _read_start_date(form), expected):
-        return
-
-    # Fallback: pick the day from the calendar widget
+    # Primary: calendar picker
     await date_input.click()
     await page.wait_for_timeout(500)
 
-    aria_day = expected.strftime("%B %d, %Y").replace(" 0", " ")  # "June 2, 2026"
+    target = expected.strftime("%B %Y")
+    for _ in range(24):
+        if await page.get_by_text(target, exact=False).count():
+            break
+        prev = page.locator('[aria-label*="Previous"], button:has-text("‹"), button:has-text("<")')
+        if await prev.count():
+            await prev.first.click()
+            await page.wait_for_timeout(200)
+        else:
+            break
+
+    aria_day = expected.strftime("%B %d, %Y").replace(" 0", " ")
     day_pick = page.locator(f'[aria-label*="{aria_day}"], [aria-label*="{expected.strftime("%B")} {expected.day},"]')
     if await day_pick.count():
         await day_pick.first.click()
     else:
-        calendar = page.locator('[class*="calendar"], [class*="DayPicker"], [role="dialog"]')
+        calendar = page.locator('[class*="calendar"], [class*="DayPicker"]')
         await calendar.get_by_role("button", name=str(expected.day), exact=True).first.click()
 
     await page.wait_for_timeout(400)
-    if not _date_matches(await _read_start_date(form), expected):
-        actual = await _read_start_date(form)
+    await _manual_entry_form(page).get_by_text("Add Manual Time Entry").click()
+    await page.wait_for_timeout(300)
+
+    actual = await _read_start_date(page)
+    if actual and _date_matches(actual, expected):
+        return
+
+    if not await _modal_is_open(page):
+        raise RuntimeError(
+            f"Modal closed while setting date to {date_str} — entry may have been saved with wrong date"
+        )
+
+    # Fallback: type date — never press Enter (it submits the form)
+    await date_input.click(click_count=3)
+    await page.keyboard.type(date_str, delay=30)
+    await _manual_entry_form(page).get_by_text("Add Manual Time Entry").click()
+    await page.wait_for_timeout(300)
+
+    if not await _modal_is_open(page):
+        raise RuntimeError(
+            f"Modal closed while setting date to {date_str} — entry may have been saved with wrong date"
+        )
+
+    actual = await _read_start_date(page)
+    if actual and not _date_matches(actual, expected):
         raise RuntimeError(f"Could not set start date to {date_str} (field shows {actual!r})")
 
 
@@ -203,13 +234,25 @@ async def login(page: Page, email: str, password: str):
     await page.fill('input[type="password"]', password)
     await page.click('button[type="submit"]')
 
-    await page.wait_for_url("**/app/**", timeout=30_000)
+    try:
+        await page.wait_for_url("**/app/**", timeout=60_000, wait_until="domcontentloaded")
+    except PWTimeout:
+        if "/app/" not in page.url:
+            raise RuntimeError(
+                "Login timed out — check TOPTRACKER_EMAIL and TOPTRACKER_PASSWORD in .env.local"
+            ) from None
     await wait_for_app(page)
     await dismiss_overlays(page)
     print(f"✓ Logged in ({page.url})")
 
 
 # ── Step 2: Add Manual Time Entries ──────────────────────────────────────────
+
+def flatten_description(text: str) -> str:
+    """TopTracker description is a single-line input — collapse Sheets-style newlines."""
+    parts = [line.strip() for line in text.replace("\t", " ").split("\n") if line.strip()]
+    return " — ".join(parts)
+
 
 async def add_manual_entry(page: Page, entry: dict, project_name: str):
     """
@@ -224,21 +267,21 @@ async def add_manual_entry(page: Page, entry: dict, project_name: str):
     """
     print(f"  → Adding: {entry['task']} ({entry['hours']}h on {entry['date']})")
 
+    await dismiss_overlays(page)
     add_btn = page.get_by_role("button", name="Add manual time")
     await add_btn.scroll_into_view_if_needed()
     await add_btn.click()
-    await page.locator("#description").wait_for(state="visible", timeout=10_000)
+    await page.locator("#description").wait_for(state="visible", timeout=15_000)
 
-    form = page.locator("form").filter(has=page.locator("#description")).first
+    form = _manual_entry_form(page)
 
-    description_text = entry.get("details") or entry["task"]
+    description_text = flatten_description(entry.get("details") or entry["task"])
 
     try:
         await form.locator("select").last.select_option(label=project_name)
     except Exception:
         pass  # project is often pre-selected to the only project
 
-    await set_start_date(form, page, entry["date"])
     await form.locator("#description").fill(description_text)
 
     total_minutes = int(round(entry["hours"] * 60))
@@ -248,17 +291,47 @@ async def add_manual_entry(page: Page, entry: dict, project_name: str):
     await form.locator("#to").fill(entry.get("worked_to", "10:00"), force=True)
     await page.wait_for_timeout(300)
 
-    await form.get_by_role("button", name="Submit").click()
-    await page.locator("#description").wait_for(state="hidden", timeout=10_000)
+    # Set date last — other fields can reset React date state back to today
+    await set_start_date(page, entry["date"])
+    confirmed = await _read_start_date(page)
+    print(f"    date confirmed: {confirmed}")
+
+    submit = _manual_entry_form(page).get_by_role("button", name="Submit")
+    await submit.scroll_into_view_if_needed()
+    await submit.click()
+    await page.locator("#description").wait_for(state="hidden", timeout=20_000)
     print("  ✓ Entry added")
 
 
-async def add_all_entries(page: Page, line_items: list[dict], project_name: str):
-    """Navigate to My Activities and add all entries."""
+async def navigate_to_activities(page: Page):
     print("\n→ Navigating to My Activities...")
     await page.goto(ACTIVITIES_URL, wait_until="domcontentloaded", timeout=30_000)
     await wait_for_app(page)
     await dismiss_overlays(page)
+
+    my_activities = page.get_by_text("My activities", exact=True)
+    add_btn = page.get_by_role("button", name="Add manual time")
+    for _ in range(3):
+        if await my_activities.count() and await add_btn.count():
+            break
+        await page.wait_for_timeout(2_000)
+        await dismiss_overlays(page)
+        await page.goto(ACTIVITIES_URL, wait_until="domcontentloaded", timeout=30_000)
+        await wait_for_app(page)
+
+    if not await add_btn.count():
+        await screenshot(page, "activities_page")
+        raise RuntimeError(
+            "Could not open My Activities page. "
+            "Check you are logged in as a freelancer at tracker.toptal.com"
+        )
+
+    await add_btn.wait_for(state="visible", timeout=15_000)
+
+
+async def add_all_entries(page: Page, line_items: list[dict], project_name: str):
+    """Navigate to My Activities and add all entries."""
+    await navigate_to_activities(page)
     await screenshot(page, "activities_page")
 
     print(f"→ Adding {len(line_items)} time entries...")
@@ -361,12 +434,12 @@ if __name__ == "__main__":
         headless=args.headless,
     )
 
-    today = datetime.now()
     test_items = [
         {
-            "date": f"{today.strftime('%b')} {today.day}, {today.year}",
+            "date": "Jun 8, 2026",
             "task": "Test Task (bot check)",
             "description": "Safe to delete",
+            "details": "Test Project\n\tTest Task (bot check)\n\t(Safe to delete)",
             "hours": 0.25,
             "worked_from": "09:00",
             "worked_to": "09:15",

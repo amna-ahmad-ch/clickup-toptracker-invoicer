@@ -164,6 +164,6 @@ python main.py --current-week --invoice-only -y
 ### Headless (no browser window)
 
 ```bash
-python main.py --current-week -y --headless
+python main.py --last-week -y --headless
 ```
 ```
