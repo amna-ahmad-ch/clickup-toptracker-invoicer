@@ -131,22 +131,22 @@ def resolve_date_range(args) -> tuple[datetime, datetime]:
 def prepare_entries(line_items: list[dict]) -> list[dict]:
     """
     Convert ClickUp line items to the format toptracker_bot expects.
-    Calculates worked_from / worked_to based on hours (starting 09:00).
+    Stacks worked_from / worked_to per day so entries on the same date don't overlap.
     """
     entries = []
+    day_cursor: dict[str, int] = {}
+
     for item in line_items:
-        # Parse date from "06 Jun 2026" → "Jun 6, 2026" (TopTracker format)
         try:
             dt = datetime.strptime(item["date"], "%d %b %Y")
             tt_date = f"{dt.strftime('%b')} {dt.day}, {dt.year}"
         except Exception:
             tt_date = item["date"]
 
-        # Simple time: start at 09:00, end at 09:00 + duration
         total_minutes = int(round(item["hours"] * 60))
-        hh = total_minutes // 60
-        mm = total_minutes % 60
-        worked_to = f"{9 + hh:02d}:{mm:02d}"
+        start_minutes = day_cursor.get(tt_date, 9 * 60)
+        end_minutes = start_minutes + total_minutes
+        day_cursor[tt_date] = end_minutes
 
         entries.append({
             "date":        tt_date,
@@ -154,8 +154,8 @@ def prepare_entries(line_items: list[dict]) -> list[dict]:
             "description": item.get("description", ""),
             "details":     item["details"],
             "hours":       item["hours"],
-            "worked_from": "09:00",
-            "worked_to":   worked_to,
+            "worked_from": f"{start_minutes // 60:02d}:{start_minutes % 60:02d}",
+            "worked_to":   f"{end_minutes // 60:02d}:{end_minutes % 60:02d}",
         })
     return entries
 
