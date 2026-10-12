@@ -23,6 +23,8 @@ from playwright.async_api import async_playwright, Page, TimeoutError as PWTimeo
 
 BASE_URL = "https://tracker.toptal.com"
 ACTIVITIES_URL = f"{BASE_URL}/app/my-activities"
+INVOICES_URL = f"{BASE_URL}/app/payments/invoices"
+CREATE_INVOICE_URL = f"{BASE_URL}/app/payments/create-invoice"
 
 
 @dataclass
@@ -330,9 +332,18 @@ async def set_start_date(page: Page, date_str: str):
 
 async def open_create_invoice_form(page: Page):
     await navigate_to_invoices(page)
-    await page.get_by_role("button", name="Create Invoice").click()
-    await page.wait_for_url("**/create-invoice**", timeout=15_000)
-    await page.get_by_role("heading", name="Create Invoice").wait_for(timeout=10_000)
+    create_btn = page.get_by_role("button", name=re.compile(r"Create Invoice", re.I))
+    if await create_btn.count():
+        await create_btn.first.click()
+        try:
+            await page.wait_for_url("**/create-invoice**", timeout=15_000)
+        except PWTimeout:
+            pass
+    if "/create-invoice" not in page.url:
+        await page.goto(CREATE_INVOICE_URL, wait_until="domcontentloaded", timeout=30_000)
+        await wait_for_app(page)
+    heading = page.get_by_role("heading", name=re.compile(r"Create Invoice", re.I))
+    await heading.wait_for(timeout=15_000)
 
 
 async def set_invoice_date_range(page: Page, start_date: datetime, end_date: datetime):
@@ -357,13 +368,36 @@ async def wait_for_save_enabled(page: Page, timeout_ms: int = 20_000) -> bool:
 
 
 async def navigate_to_invoices(page: Page):
-    await page.goto(ACTIVITIES_URL, wait_until="domcontentloaded", timeout=30_000)
+    """Open the invoices list. Prefer the known URL — sidebar labels change."""
+    await dismiss_overlays(page)
+    await page.goto(INVOICES_URL, wait_until="domcontentloaded", timeout=30_000)
     await wait_for_app(page)
     await dismiss_overlays(page)
-    await page.get_by_text("Invoices", exact=True).locator("visible=true").last.click()
-    await page.wait_for_url("**/payments/invoices**", timeout=15_000)
-    await wait_for_app(page)
-    await dismiss_overlays(page)
+
+    if "/payments/invoices" in page.url:
+        return
+
+    # Fallback: sidebar link (label is not always exactly "Invoices")
+    for name in ("Invoices", "Worker invoices", "Payments"):
+        link = page.get_by_role("link", name=re.compile(name, re.I))
+        if await link.count():
+            await link.first.click()
+            await wait_for_app(page)
+            if "/payments/invoices" in page.url or "/create-invoice" in page.url:
+                return
+        text = page.get_by_text(re.compile(rf"^{name}$", re.I)).locator("visible=true")
+        if await text.count():
+            await text.last.click()
+            await wait_for_app(page)
+            if "/payments/invoices" in page.url:
+                return
+
+    if "/payments/invoices" not in page.url:
+        await screenshot(page, "invoices_nav")
+        raise RuntimeError(
+            f"Could not open Invoices page (landed on {page.url}). "
+            "Open tracker.toptal.com/app/payments/invoices manually to confirm access."
+        )
 
 
 # ── Step 1: Login ─────────────────────────────────────────────────────────────
